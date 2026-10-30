@@ -1,0 +1,85 @@
+# Gold Layer Data Catalog
+
+The gold layer is the business-ready, star-schema layer of the DataWarehouse. It is built from the cleansed `silver` tables and exposed as three views: two dimensions and one fact. This catalog documents each view, its grain, its columns, and where the data comes from.
+
+## Overview
+
+| View | Type | Grain | Purpose |
+|---|---|---|---|
+| `gold.dim_customers` | Dimension | One row per customer | Customer attributes combined from CRM and ERP |
+| `gold.dim_products` | Dimension | One row per current product | Product attributes and category hierarchy; active products only |
+| `gold.fact_sales` | Fact | One row per sales order line | Sales transactions linked to both dimensions by surrogate key |
+
+## 1. gold.dim_customers
+
+**Purpose:** Master list of customers, merging CRM customer records with ERP demographic and location data.
+
+**Sources:** `silver.crm_cust_info` (primary), `silver.erp_cust_az12` (birthdate, gender fallback), `silver.erp_loc_a101` (country). ERP tables are LEFT JOINed on `cst_key = cid`.
+
+| Column | Description | Source |
+|---|---|---|
+| `customer_key` | Surrogate key, generated with `ROW_NUMBER()` ordered by `cst_id`. Used to join from the fact table. | Generated |
+| `customer_id` | Customer ID from the CRM system. | `crm_cust_info.cst_id` |
+| `customer_number` | Alphanumeric customer identifier; the join key to the ERP tables. | `crm_cust_info.cst_key` |
+| `first_name` | Customer first name. | `crm_cust_info.cst_firstname` |
+| `last_name` | Customer last name. | `crm_cust_info.cst_lastname` |
+| `country` | Customer country of residence. | `erp_loc_a101.cntry` |
+| `marital_status` | Customer marital status. | `crm_cust_info.cst_material_status` (source column is spelled "material") |
+| `gender` | Customer gender. CRM is the master source; if CRM is `n/a`, the ERP value is used, otherwise `n/a`. | `crm_cust_info.cst_gndr`, fallback `erp_cust_az12.gen` |
+| `birthdate` | Customer date of birth. | `erp_cust_az12.bdate` |
+| `create_date` | Date the customer record was created in the CRM. | `crm_cust_info.cst_create_date` |
+
+## 2. gold.dim_products
+
+**Purpose:** Product master with its category, subcategory and cost information.
+
+**Sources:** `silver.crm_prd_info` (primary), `silver.erp_px_cat_g1v2` (category hierarchy), LEFT JOINed on `cat_id = id`.
+
+**Filter:** `prd_end_dt IS NULL`, so only current products are included and historical versions are excluded.
+
+| Column | Description | Source |
+|---|---|---|
+| `product_key` | Surrogate key, generated with `ROW_NUMBER()` ordered by start date and product key. Used to join from the fact table. | Generated |
+| `product_id` | Product ID from the CRM system. | `crm_prd_info.prd_id` |
+| `product_number` | Alphanumeric product identifier; the join key to sales. | `crm_prd_info.prd_key` |
+| `product_name` | Product name. | `crm_prd_info.prd_nm` |
+| `category_id` | ID linking the product to its category. | `crm_prd_info.cat_id` |
+| `category` | High-level product category. | `erp_px_cat_g1v2.cat` |
+| `subcategory` | More detailed product classification. | `erp_px_cat_g1v2.subcat` |
+| `maintenance` | Whether the product requires maintenance. | `erp_px_cat_g1v2.maintainance` (source column is spelled "maintainance") |
+| `cost` | Product cost. | `crm_prd_info.prd_cost` |
+| `product_line` | Product line or series. | `crm_prd_info.prd_line` |
+| `start_date` | Date the product became available. | `crm_prd_info.prd_start_dt` |
+
+## 3. gold.fact_sales
+
+**Purpose:** Transactional sales data for analytics and reporting.
+
+**Sources:** `silver.crm_sales_details`, LEFT JOINed to `gold.dim_products` on `sls_prd_key = product_number` and to `gold.dim_customers` on `sls_crust_id = customer_id`.
+
+| Column | Description | Source |
+|---|---|---|
+| `order_number` | Sales order identifier. | `crm_sales_details.sls_ord_num` |
+| `product_key` | Foreign key to `gold.dim_products.product_key`. | `dim_products` |
+| `customer_key` | Foreign key to `gold.dim_customers.customer_key`. | `dim_customers` |
+| `order_date` | Date the order was placed. | `crm_sales_details.sls_order_dt` |
+| `shipping_date` | Date the order was shipped. | `crm_sales_details.sls_ship_dt` |
+| `due_date` | Date payment was due. | `crm_sales_details.sls_due_dt` |
+| `sales_amount` | Total sales amount for the line. | `crm_sales_details.sls_sales` |
+| `quantity` | Number of units ordered. | `crm_sales_details.sls_quantity` |
+| `price` | Unit price. | `crm_sales_details.sls_price` |
+
+## Relationships
+
+| From | Column | To | Column | Cardinality |
+|---|---|---|---|---|
+| `gold.fact_sales` | `customer_key` | `gold.dim_customers` | `customer_key` | Many to one |
+| `gold.fact_sales` | `product_key` | `gold.dim_products` | `product_key` | Many to one |
+
+## Notes and Caveats
+
+- **Surrogate keys are computed at query time.** `ROW_NUMBER()` values can change if the underlying silver data changes, so do not store them outside the warehouse.
+- **Fact rows can have NULL keys.** Both joins are LEFT JOINs, so a sale with no matching customer or product keeps its row with a NULL key. Validate with: `SELECT * FROM gold.fact_sales f LEFT JOIN gold.dim_customers c ON c.customer_key = f.customer_key LEFT JOIN gold.dim_products p ON p.product_key = f.product_key WHERE p.product_key IS NULL OR c.customer_key IS NULL;` Zero rows means full referential integrity.
+- **Products are current-only.** Sales of discontinued products (those with a non-NULL `prd_end_dt`) will have a NULL `product_key`.
+- **Source column spellings.** `cst_material_status` and `maintainance` are misspelled in the source tables; the gold views expose corrected names (`marital_status`, `maintenance`).
+- **Data types** are not listed here. Add them from `INFORMATION_SCHEMA.COLUMNS` where `TABLE_SCHEMA = 'gold'` if your documentation standard requires them.
