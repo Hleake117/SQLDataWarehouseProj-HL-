@@ -1,0 +1,56 @@
+/*
+==================================================================================
+Performance Analysis
+==================================================================================
+Purpose:
+	- Compare each product's yearly sales to its own long-term average
+	- Compare each product's yearly sales to the previous year
+	- Flag years that are above or below average
+
+Tables Used:
+	- gold.fact_sales
+	- gold.dim_products
+
+SQL Functions Used:
+	- Window functions: AVG() OVER(), LAG() OVER()
+	- CASE expressions
+==================================================================================
+*/
+
+
+-- ================================================================================
+-- Yearly product performance vs. product average and prior year
+-- ================================================================================
+
+-- Step 1: total sales per product per year
+WITH yearly_product_sales AS (
+	SELECT
+		YEAR(f.order_date)	AS order_year,
+		p.product_name,
+		SUM(f.sales_amount)	AS current_sales
+	FROM gold.fact_sales f
+	LEFT JOIN gold.dim_products p
+		ON f.product_key = p.product_key
+	WHERE f.order_date IS NOT NULL
+	GROUP BY YEAR(f.order_date), p.product_name
+)
+
+-- Step 2: add average, difference from average, and previous year's sales
+SELECT
+	order_year,
+	product_name,
+	current_sales,
+	-- average yearly sales for this product across all years
+	AVG(current_sales) OVER (PARTITION BY product_name)	AS avg_sales,
+	-- how far this year is from that average
+	current_sales - AVG(current_sales) OVER (PARTITION BY product_name) AS diff_avg,
+	-- label the year relative to the product's average
+	CASE
+		WHEN current_sales - AVG(current_sales) OVER (PARTITION BY product_name) > 0 THEN 'Above Avg'
+		WHEN current_sales - AVG(current_sales) OVER (PARTITION BY product_name) < 0 THEN 'Below Avg'
+		ELSE 'Avg'
+	END AS avg_change,
+	-- previous year's sales for this product (NULL for the first year)
+	LAG(current_sales) OVER (PARTITION BY product_name ORDER BY order_year) AS py_sales
+FROM yearly_product_sales
+ORDER BY product_name, order_year;
